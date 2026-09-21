@@ -12,7 +12,95 @@ PROTO TwoWheelRobot [
   field SFString   controller     "<none>"
   field MFString   controllerArgs []
   field SFColor    bodyColor      0.15 0.15 0.6
-  field MFNode     extensionSlot  []
+  field MFNode     extensionSlot  [
+    DistanceSensor {
+      translation 0.041 0 0.04
+      rotation 0 0 1 0
+      children [
+        Shape {
+          appearance PBRAppearance {
+            baseColor 0.8 0.1 0.1
+            roughness 1
+            metalness 0
+          }
+          geometry Box {
+            size 0.006 0.008 0.008
+          }
+        }
+      ]
+      name "front_distance_sensor"
+      lookupTable [
+        0 0 0
+        2 2 0
+      ]
+      type "generic"
+    }
+    DistanceSensor {
+      translation 0.02 0.026 0.04
+      rotation 0 0 1 1.5708
+      children [
+        Shape {
+          appearance PBRAppearance {
+            baseColor 0.8 0.1 0.1
+            roughness 1
+            metalness 0
+          }
+          geometry Box {
+            size 0.006 0.008 0.008
+          }
+        }
+      ]
+      name "left_distance_sensor"
+      lookupTable [
+        0 0 0
+        2 2 0
+      ]
+      type "generic"
+    }
+    DistanceSensor {
+      translation 0.02 -0.026 0.04
+      rotation 0 0 1 -1.5708
+      children [
+        Shape {
+          appearance PBRAppearance {
+            baseColor 0.8 0.1 0.1
+            roughness 1
+            metalness 0
+          }
+          geometry Box {
+            size 0.006 0.008 0.008
+          }
+        }
+      ]
+      name "right_distance_sensor"
+      lookupTable [
+        0 0 0
+        2 2 0
+      ]
+      type "generic"
+    }
+    Camera {
+      translation 0.04 0 0.058
+      rotation 0 0 1 0
+      children [
+        Shape {
+          appearance PBRAppearance {
+            baseColor 0.1 0.1 0.1
+            roughness 1
+            metalness 0
+          }
+          geometry Box {
+            size 0.008 0.012 0.01
+          }
+        }
+      ]
+      name "endpoint_camera"
+      fieldOfView 1.047
+      width 160
+      height 120
+      near 0.01
+    }
+  ]
 ] {
   Robot {
     translation IS translation

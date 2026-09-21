@@ -1,3 +1,7 @@
 # Webots runtime state files
 *.wbproj
 .*.wbproj
+
+# Python cache
+__pycache__/
+*.pyc
