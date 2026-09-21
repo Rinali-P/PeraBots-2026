@@ -1,0 +1,3 @@
+# Webots runtime state files
+*.wbproj
+.*.wbproj
