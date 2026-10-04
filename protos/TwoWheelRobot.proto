@@ -4,6 +4,10 @@
 # teams may only change cosmetic fields and add their own sensors/parts
 # through "extensionSlot" without touching the drivetrain itself.
 # supervisor is hardcoded FALSE and not exposed, so it cannot be enabled.
+#
+# TEAM SENSORS: 9 x DistanceSensor (front fan + 2 sides) and 1 x InertialUnit
+# are baked into the DEFAULT value of extensionSlot, so they travel with this
+# PROTO file into the official evaluation world.
 
 PROTO TwoWheelRobot [
   field SFVec3f    translation    0 0 0
@@ -13,93 +17,208 @@ PROTO TwoWheelRobot [
   field MFString   controllerArgs []
   field SFColor    bodyColor      0.15 0.15 0.6
   field MFNode     extensionSlot  [
-    DistanceSensor {
-      translation 0.041 0 0.04
-      rotation 0 0 1 0
-      children [
-        Shape {
-          appearance PBRAppearance {
-            baseColor 0.8 0.1 0.1
-            roughness 1
-            metalness 0
+      DistanceSensor {
+        translation 0.03 -0.03 0.045
+        rotation 0 0 1 -1.57080
+        name "ds_m90"
+        lookupTable [
+          0 0 0
+          0.6 0.6 0
+        ]
+        numberOfRays 1
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor 0.9 0.1 0.1
+              roughness 1
+              metalness 0
+            }
+            geometry Box {
+              size 0.006 0.008 0.008
+            }
           }
-          geometry Box {
-            size 0.006 0.008 0.008
+        ]
+      }
+      DistanceSensor {
+        translation 0.043 -0.02 0.045
+        rotation 0 0 1 -1.04720
+        name "ds_m60"
+        lookupTable [
+          0 0 0
+          0.6 0.6 0
+        ]
+        numberOfRays 1
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor 0.9 0.1 0.1
+              roughness 1
+              metalness 0
+            }
+            geometry Box {
+              size 0.006 0.008 0.008
+            }
           }
-        }
-      ]
-      name "front_distance_sensor"
-      lookupTable [
-        0 0 0
-        2 2 0
-      ]
-      type "generic"
-    }
-    DistanceSensor {
-      translation 0.02 0.026 0.04
-      rotation 0 0 1 1.5708
-      children [
-        Shape {
-          appearance PBRAppearance {
-            baseColor 0.8 0.1 0.1
-            roughness 1
-            metalness 0
+        ]
+      }
+      DistanceSensor {
+        translation 0.043 -0.013 0.045
+        rotation 0 0 1 -0.69813
+        name "ds_m40"
+        lookupTable [
+          0 0 0
+          0.6 0.6 0
+        ]
+        numberOfRays 1
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor 0.9 0.1 0.1
+              roughness 1
+              metalness 0
+            }
+            geometry Box {
+              size 0.006 0.008 0.008
+            }
           }
-          geometry Box {
-            size 0.006 0.008 0.008
+        ]
+      }
+      DistanceSensor {
+        translation 0.043 -0.006 0.045
+        rotation 0 0 1 -0.34907
+        name "ds_m20"
+        lookupTable [
+          0 0 0
+          0.6 0.6 0
+        ]
+        numberOfRays 1
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor 0.9 0.1 0.1
+              roughness 1
+              metalness 0
+            }
+            geometry Box {
+              size 0.006 0.008 0.008
+            }
           }
-        }
-      ]
-      name "left_distance_sensor"
-      lookupTable [
-        0 0 0
-        2 2 0
-      ]
-      type "generic"
-    }
-    DistanceSensor {
-      translation 0.02 -0.026 0.04
-      rotation 0 0 1 -1.5708
-      children [
-        Shape {
-          appearance PBRAppearance {
-            baseColor 0.8 0.1 0.1
-            roughness 1
-            metalness 0
+        ]
+      }
+      DistanceSensor {
+        translation 0.043 0.0 0.045
+        rotation 0 0 1 0.00000
+        name "ds_0"
+        lookupTable [
+          0 0 0
+          0.6 0.6 0
+        ]
+        numberOfRays 1
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor 0.9 0.1 0.1
+              roughness 1
+              metalness 0
+            }
+            geometry Box {
+              size 0.006 0.008 0.008
+            }
           }
-          geometry Box {
-            size 0.006 0.008 0.008
+        ]
+      }
+      DistanceSensor {
+        translation 0.043 0.006 0.045
+        rotation 0 0 1 0.34907
+        name "ds_p20"
+        lookupTable [
+          0 0 0
+          0.6 0.6 0
+        ]
+        numberOfRays 1
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor 0.9 0.1 0.1
+              roughness 1
+              metalness 0
+            }
+            geometry Box {
+              size 0.006 0.008 0.008
+            }
           }
-        }
-      ]
-      name "right_distance_sensor"
-      lookupTable [
-        0 0 0
-        2 2 0
-      ]
-      type "generic"
-    }
-    Camera {
-      translation 0.04 0 0.058
-      rotation 0 0 1 0
-      children [
-        Shape {
-          appearance PBRAppearance {
-            baseColor 0.1 0.1 0.1
-            roughness 1
-            metalness 0
+        ]
+      }
+      DistanceSensor {
+        translation 0.043 0.013 0.045
+        rotation 0 0 1 0.69813
+        name "ds_p40"
+        lookupTable [
+          0 0 0
+          0.6 0.6 0
+        ]
+        numberOfRays 1
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor 0.9 0.1 0.1
+              roughness 1
+              metalness 0
+            }
+            geometry Box {
+              size 0.006 0.008 0.008
+            }
           }
-          geometry Box {
-            size 0.008 0.012 0.01
+        ]
+      }
+      DistanceSensor {
+        translation 0.043 0.02 0.045
+        rotation 0 0 1 1.04720
+        name "ds_p60"
+        lookupTable [
+          0 0 0
+          0.6 0.6 0
+        ]
+        numberOfRays 1
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor 0.9 0.1 0.1
+              roughness 1
+              metalness 0
+            }
+            geometry Box {
+              size 0.006 0.008 0.008
+            }
           }
-        }
-      ]
-      name "endpoint_camera"
-      fieldOfView 1.047
-      width 160
-      height 120
-      near 0.01
-    }
+        ]
+      }
+      DistanceSensor {
+        translation 0.03 0.03 0.045
+        rotation 0 0 1 1.57080
+        name "ds_p90"
+        lookupTable [
+          0 0 0
+          0.6 0.6 0
+        ]
+        numberOfRays 1
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor 0.9 0.1 0.1
+              roughness 1
+              metalness 0
+            }
+            geometry Box {
+              size 0.006 0.008 0.008
+            }
+          }
+        ]
+      }
+      InertialUnit {
+        translation 0 0 0.045
+        name "imu"
+      }
   ]
 ] {
   Robot {
@@ -131,7 +250,7 @@ PROTO TwoWheelRobot [
       HingeJoint {
         jointParameters HingeJointParameters {
           axis 0 1 0
-          anchor 0 0.032 0.02
+          anchor 0.01 0.032 0.02
         }
         device [
           RotationalMotor {
@@ -142,7 +261,7 @@ PROTO TwoWheelRobot [
           }
         ]
         endPoint Solid {
-          translation 0 0.032 0.02
+          translation 0.01 0.032 0.02
           rotation 1 0 0 1.5708
           children [
             Shape {
@@ -173,7 +292,7 @@ PROTO TwoWheelRobot [
       HingeJoint {
         jointParameters HingeJointParameters {
           axis 0 1 0
-          anchor 0 -0.032 0.02
+          anchor 0.01 -0.032 0.02
         }
         device [
           RotationalMotor {
@@ -184,7 +303,7 @@ PROTO TwoWheelRobot [
           }
         ]
         endPoint Solid {
-          translation 0 -0.032 0.02
+          translation 0.01 -0.032 0.02
           rotation 1 0 0 1.5708
           children [
             Shape {
