@@ -215,6 +215,30 @@ PROTO TwoWheelRobot [
           }
         ]
       }
+      Camera {
+        translation 0.043 0 0.025
+        rotation 0 1 0 0
+        name "front_camera"
+        width 320
+        height 240
+        fieldOfView 1.0472
+        near 0.01
+        far 1.0
+
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor 1 0 0
+              roughness 0.5
+              metalness 0
+            }
+            geometry Box {
+              size 0.015 0.012 0.010
+            }
+          }
+        ]
+      }
+
       InertialUnit {
         translation 0 0 0.045
         name "imu"

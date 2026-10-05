@@ -1,696 +1,2440 @@
 """
-main_controller.py  -  PeraBots 2026, Phase 1, SECTION 1 (obstacle navigation)
+main_controller.py
 
-File placement (name must not change):
-  controllers/main_controller/main_controller.py
+PeraBots 2026 - Phase 1
+Generalized Section 1 Autonomous Navigation
 
-Strategy
---------
-1. START-UP LOCALISATION  (~3.5 s)
-   The robot spins once on the spot, sweeping its front distance sensor over the
-   two arena walls that form the start-zone corner.  A small least-squares fit
-   gives (a) the robot's distance to each wall -> its (x, y), and (b) the wall
-   directions -> its absolute heading.  The InertialUnit is then only used as a
-   drift-free gyro (its sign / zero offset are calibrated automatically), so we
-   do not depend on any coordinate-system convention.
-2. ODOMETRY   wheel encoders (distance) + InertialUnit (heading).  No GPS.
-3. MAPPING    9 DistanceSensors -> log-odds occupancy grid (2 cm cells).
-4. PLANNING   A* on the map inflated by the robot radius + safety margin,
-   unknown space is assumed free ("optimistic"), so the robot heads straight for
-   the goal and re-plans the moment a new obstacle is seen.  Paths are
-   string-pulled (line-of-sight smoothing) to keep distance short.
-5. CONTROL    pure-pursuit style follower, turn-in-place when the heading error
-   is large, speed limited by the front sensors, simple stuck recovery.
+CURRENT STRATEGY
+----------------
+1. Localization:
+      - Wheel encoders estimate travelled distance.
+      - IMU provides heading.
+      - Pose = (x, y, theta).
 
-Nothing about the obstacle layout is hard-coded.  Only the FIXED arena frame
-(outer walls, transition gap, transition tile) is used, which the rulebook
-states is identical in the evaluation environment.
+2. Mapping:
+      - Distance sensors observe walls/obstacles.
+      - Sensor rays update an occupancy grid.
+      - Free space and occupied space are stored.
 
-The LEDs are NOT touched here (rulebook 4.4: only for the Section 2 result).
+3. Exploration:
+      - Robot searches for frontier cells.
+      - A frontier = known free space next to unknown space.
+      - Robot prefers frontiers that can reveal new space.
+      - Already explored areas are not selected as exploration goals.
+
+4. Planning:
+      - A* plans from the CURRENT robot position
+        to the selected unexplored frontier.
+
+5. Safety:
+      - Distance sensors always have priority over A*.
+      - If an obstacle becomes dangerously close,
+        the robot immediately slows/stops/avoids it.
+
+6. FUTURE CAMERA:
+      - Camera can later detect the red transition/end target.
+      - That detected target will become the A* goal.
+      - No red target coordinate is hard-coded here.
+
+IMPORTANT
+---------
+- No hard-coded obstacle locations.
+- No hard-coded transition coordinate.
+- No predetermined obstacle route.
+- No boundary-frontier assumption.
+- No GPS.
+- No Supervisor.
 """
 
+from controller import Robot
 import math
 import heapq
-from controller import Robot
 
-# ----------------------------------------------------------------------------
-# Robot geometry (from TwoWheelRobot.proto - locked)
-# ----------------------------------------------------------------------------
-WHEEL_R = 0.02
-AXLE = 0.064                 # wheel centres at y = +/-0.032
-MAX_WHEEL = 8.0              # rad/s used by us (motor limit is 10)
 
-# Distance sensors: name, x, y (robot frame), yaw in degrees.
-# MUST match the DistanceSensor nodes in TwoWheelRobot.proto -> extensionSlot.
-SENSORS = [
-    ("ds_m90", 0.025, -0.030, -90.0),
-    ("ds_m60", 0.038, -0.020, -60.0),
-    ("ds_m40", 0.038, -0.013, -40.0),
-    ("ds_m20", 0.038, -0.006, -20.0),
-    ("ds_0",   0.038,  0.000,   0.0),
-    ("ds_p20", 0.038,  0.006,  20.0),
-    ("ds_p40", 0.038,  0.013,  40.0),
-    ("ds_p60", 0.038,  0.020,  60.0),
-    ("ds_p90", 0.025,  0.030,  90.0),
+# ============================================================
+# ROBOT / CONTROL PARAMETERS
+# ============================================================
+
+TIME_STEP = 32
+
+MAX_MOTOR = 10.0
+MAX_WHEEL = 3.0
+
+WHEEL_RADIUS = 0.020
+AXLE_LENGTH = 0.064
+
+# ------------------------------------------------------------
+# Occupancy grid
+# ------------------------------------------------------------
+
+GRID_RES = 0.02
+
+# Robot radius + safety margin.
+ROBOT_RADIUS = 0.05
+SAFETY_MARGIN = 0.02
+INFLATION_RADIUS = ROBOT_RADIUS + SAFETY_MARGIN
+
+# Distance sensor useful range.
+SENSOR_RANGE = 0.30
+
+# ------------------------------------------------------------
+# Immediate obstacle safety
+# ------------------------------------------------------------
+
+FRONT_SLOW = 0.20
+FRONT_BLOCK = 0.10
+FRONT_EMERGENCY = 0.06
+
+SIDE_SLOW = 0.12
+SIDE_BLOCK = 0.06
+
+# ------------------------------------------------------------
+# Occupancy log-odds
+# ------------------------------------------------------------
+
+OCCUPIED_THRESHOLD = 0.55
+FREE_THRESHOLD = -0.25
+
+# ------------------------------------------------------------
+# Planning
+# ------------------------------------------------------------
+
+REPLAN_TIME = 0.8
+
+# Maximum distance around robot from which frontiers
+# are considered.
+FRONTIER_SEARCH_RADIUS = 65
+
+# A target is considered reached within this distance.
+TARGET_REACHED_DISTANCE = 0.075
+
+# Do not select a frontier immediately next to robot.
+MIN_FRONTIER_DISTANCE = 0.12
+
+# ------------------------------------------------------------
+# Stuck detection
+# ------------------------------------------------------------
+
+STUCK_TIME = 2.5
+MIN_PROGRESS = 0.035
+
+
+# ============================================================
+# DISTANCE SENSOR CONFIGURATION
+# ============================================================
+
+SENSOR_NAMES = [
+    "ds_m90",
+    "ds_m60",
+    "ds_m40",
+    "ds_m20",
+    "ds_0",
+    "ds_p20",
+    "ds_p40",
+    "ds_p60",
+    "ds_p90",
 ]
-IDX_FRONT = 4
-FRONT_IDX = (3, 4, 5)        # ds_m20, ds_0, ds_p20
-MAXR = 0.6                   # lookupTable max (m); returned when nothing is hit
-FRONT_OFFSET = 0.038         # x of the front sensor
 
-# ----------------------------------------------------------------------------
-# Tunables
-# ----------------------------------------------------------------------------
-V_CRUISE = 0.15              # m/s
-W_MAX = 3.2                  # rad/s   max turn rate
-SPIN_WHEEL = 3.0             # rad/s   wheel speed during start-up scan
-LOOKAHEAD = 0.12             # m
-INFLATE = 0.075              # m   robot radius (0.047) + safety margin
-CELL = 0.02                  # m   grid resolution
+SENSOR_ANGLES = [
+    math.radians(-90),
+    math.radians(-60),
+    math.radians(-40),
+    math.radians(-20),
+    0.0,
+    math.radians(20),
+    math.radians(40),
+    math.radians(60),
+    math.radians(90),
+]
 
-# ----------------------------------------------------------------------------
-# Fixed arena frame (Arena.proto / rulebook 4.3)
-# ----------------------------------------------------------------------------
-ARENA_W, ARENA_H = 2.44, 1.22
-WALL_HALF = 0.006            # half wall thickness -> inner face offset
-GAP_X0, GAP_X1 = 0.101, 0.339    # opening in the top wall (transition zone)
-CHAMBER_TOP = 1.36
-GOAL = (0.22, 1.27)          # centre of the red transition tile
-START_ZONE_CENTRE = (2.315, 0.125)   # only used if the start-up fit fails
-
-NX = int(round(ARENA_W / CELL))
-NY = int(round(1.40 / CELL))
-INF = 1e18
-
-
-def wrap(a):
-    return (a + math.pi) % (2.0 * math.pi) - math.pi
-
-
-def in_domain(x, y):
-    """True where the robot centre may exist according to the fixed arena."""
-    if WALL_HALF <= x <= ARENA_W - WALL_HALF and WALL_HALF <= y <= ARENA_H - WALL_HALF:
-        return True
-    if GAP_X0 <= x <= GAP_X1 and ARENA_H - 0.06 <= y <= CHAMBER_TOP:
-        return True
-    return False
+# Approximate sensor positions relative to robot centre.
+#
+# These are only used to improve the map ray origin.
+# They are NOT obstacle coordinates.
+#
+# If the actual PROTO sensor positions differ significantly,
+# these values should be changed to match the robot.
+SENSOR_OFFSETS = [
+    (0.025, -0.030),
+    (0.038, -0.020),
+    (0.038, -0.013),
+    (0.038, -0.006),
+    (0.038,  0.000),
+    (0.038,  0.006),
+    (0.038,  0.013),
+    (0.038,  0.020),
+    (0.025,  0.030),
+]
 
 
-R_CELLS = INFLATE / CELL
-OFFS = [(di, dj) for di in range(-5, 6) for dj in range(-5, 6)
-        if math.hypot(di, dj) <= R_CELLS]
+# ============================================================
+# GENERAL UTILITIES
+# ============================================================
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
 
 
-def build_static():
-    outdom = bytearray(NX * NY)
-    for j in range(NY):
-        for i in range(NX):
-            if not in_domain((i + 0.5) * CELL, (j + 0.5) * CELL):
-                outdom[j * NX + i] = 1
-    blocked = bytearray(NX * NY)
-    for j in range(NY):
-        for i in range(NX):
-            if outdom[j * NX + i]:
-                blocked[j * NX + i] = 1
-                continue
-            for di, dj in OFFS:
-                ii, jj = i + di, j + dj
-                if ii < 0 or jj < 0 or ii >= NX or jj >= NY or outdom[jj * NX + ii]:
-                    blocked[j * NX + i] = 1
-                    break
-    return outdom, blocked
+def wrap(angle):
+    while angle > math.pi:
+        angle -= 2.0 * math.pi
+
+    while angle < -math.pi:
+        angle += 2.0 * math.pi
+
+    return angle
 
 
-OUTDOM, STATIC_BLOCKED = build_static()
+def distance(a, b):
+    return math.hypot(
+        a[0] - b[0],
+        a[1] - b[1]
+    )
 
 
-def cell_of(x, y):
-    return int(math.floor(x / CELL)), int(math.floor(y / CELL))
+# ============================================================
+# OCCUPANCY GRID
+# ============================================================
+
+class OccupancyGrid:
+
+    UNKNOWN = 0
+    FREE = 1
+    OCCUPIED = 2
+
+    def __init__(self):
+
+        # We use a local map rather than assuming the robot
+        # knows an absolute world position.
+        #
+        # The robot's starting position is the map origin.
+        #
+        # Large enough for the Section 1 arena and exploration.
+        self.w = 180
+        self.h = 180
+
+        # Origin is in the centre of this grid.
+        self.origin_x = self.w // 2
+        self.origin_y = self.h // 2
+
+        self.logodds = [
+            [0.0 for _ in range(self.h)]
+            for _ in range(self.w)
+        ]
+
+    # --------------------------------------------------------
+    # Grid boundaries
+    # --------------------------------------------------------
+
+    def inside(self, gx, gy):
+
+        return (
+            0 <= gx < self.w and
+            0 <= gy < self.h
+        )
+
+    # --------------------------------------------------------
+    # World -> grid
+    # --------------------------------------------------------
+
+    def world_to_grid(self, x, y):
+
+        gx = int(
+            round(x / GRID_RES)
+        ) + self.origin_x
+
+        gy = int(
+            round(y / GRID_RES)
+        ) + self.origin_y
+
+        return gx, gy
+
+    # --------------------------------------------------------
+    # Grid -> world
+    # --------------------------------------------------------
+
+    def grid_to_world(self, gx, gy):
+
+        x = (
+            gx - self.origin_x
+        ) * GRID_RES
+
+        y = (
+            gy - self.origin_y
+        ) * GRID_RES
+
+        return x, y
+
+    # --------------------------------------------------------
+    # Map update
+    # --------------------------------------------------------
+
+    def update_free(self, gx, gy):
+
+        if not self.inside(gx, gy):
+            return
+
+        self.logodds[gx][gy] -= 0.30
+
+        self.logodds[gx][gy] = max(
+            -4.0,
+            self.logodds[gx][gy]
+        )
+
+    def update_occupied(self, gx, gy):
+
+        if not self.inside(gx, gy):
+            return
+
+        self.logodds[gx][gy] += 0.85
+
+        self.logodds[gx][gy] = min(
+            5.0,
+            self.logodds[gx][gy]
+        )
+
+    # --------------------------------------------------------
+    # Cell state
+    # --------------------------------------------------------
+
+    def state(self, gx, gy):
+
+        if not self.inside(gx, gy):
+            return self.OCCUPIED
+
+        value = self.logodds[gx][gy]
+
+        if value > OCCUPIED_THRESHOLD:
+            return self.OCCUPIED
+
+        if value < FREE_THRESHOLD:
+            return self.FREE
+
+        return self.UNKNOWN
+
+    def occupied(self, gx, gy):
+
+        return (
+            self.state(gx, gy)
+            == self.OCCUPIED
+        )
+
+    def free(self, gx, gy):
+
+        return (
+            self.state(gx, gy)
+            == self.FREE
+        )
+
+    def unknown(self, gx, gy):
+
+        return (
+            self.state(gx, gy)
+            == self.UNKNOWN
+        )
 
 
-def nearest_free(blocked, c, rmax=12):
-    ci, cj = c
-    best, bd = None, INF
-    for dj in range(-rmax, rmax + 1):
-        for di in range(-rmax, rmax + 1):
-            i, j = ci + di, cj + dj
-            if 0 <= i < NX and 0 <= j < NY and not blocked[j * NX + i]:
-                d = di * di + dj * dj
-                if d < bd:
-                    best, bd = (i, j), d
-    return best
-
-
-_MOVES = [(1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
-          (1, 1, 1.41421356), (1, -1, 1.41421356),
-          (-1, 1, 1.41421356), (-1, -1, 1.41421356)]
-
-
-def astar(blocked, start, goal):
-    if not (0 <= start[0] < NX and 0 <= start[1] < NY):
-        return None
-    if blocked[start[1] * NX + start[0]]:
-        start = nearest_free(blocked, start)
-        if start is None:
-            return None
-    if blocked[goal[1] * NX + goal[0]]:
-        goal = nearest_free(blocked, goal)
-        if goal is None:
-            return None
-    gi, gj = goal
-    N = NX * NY
-    g = [INF] * N
-    parent = [-1] * N
-    s_idx = start[1] * NX + start[0]
-    g[s_idx] = 0.0
-    heap = [(0.0, s_idx)]
-    closed = bytearray(N)
-    while heap:
-        _, idx = heapq.heappop(heap)
-        if closed[idx]:
-            continue
-        closed[idx] = 1
-        i, j = idx % NX, idx // NX
-        if i == gi and j == gj:
-            out = []
-            while idx != -1:
-                out.append((idx % NX, idx // NX))
-                idx = parent[idx]
-            out.reverse()
-            return out
-        for di, dj, cost in _MOVES:
-            ni, nj = i + di, j + dj
-            if ni < 0 or nj < 0 or ni >= NX or nj >= NY:
-                continue
-            nidx = nj * NX + ni
-            if blocked[nidx] or closed[nidx]:
-                continue
-            if di != 0 and dj != 0:       # no corner cutting
-                if blocked[j * NX + ni] or blocked[nj * NX + i]:
-                    continue
-            ng = g[idx] + cost
-            if ng < g[nidx]:
-                g[nidx] = ng
-                parent[nidx] = idx
-                dx, dy = abs(ni - gi), abs(nj - gj)
-                h = (dx + dy) - 0.5857864 * min(dx, dy)
-                heapq.heappush(heap, (ng + h, nidx))
-    return None
-
-
-def seg_free(blocked, a, b):
-    """Sample the straight segment a->b (world coords) against the grid."""
-    dx, dy = b[0] - a[0], b[1] - a[1]
-    L = math.hypot(dx, dy)
-    n = max(1, int(L / 0.01))
-    for k in range(n + 1):
-        t = k / n
-        i, j = cell_of(a[0] + t * dx, a[1] + t * dy)
-        if i < 0 or j < 0 or i >= NX or j >= NY or blocked[j * NX + i]:
-            return False
-    return True
-
-
-def smooth_path(blocked, pts):
-    if len(pts) <= 2:
-        return pts
-    out = [pts[0]]
-    i = 0
-    while i < len(pts) - 1:
-        j = i + 1
-        while j + 1 < len(pts) and seg_free(blocked, pts[i], pts[j + 1]):
-            j += 1
-        out.append(pts[j])
-        i = j
-    return out
-
-
-# ----------------------------------------------------------------------------
-# Start-up wall fit
-# ----------------------------------------------------------------------------
-def fit_wall(pts, centre, half):
-    """Fit 1/r = A cos(phi) + B sin(phi) (a straight wall) to samples near
-    'centre'. Returns (normal_angle, perpendicular_distance) or None."""
-    sel = [(p, 1.0 / r) for (p, r) in pts if abs(wrap(p - centre)) <= half]
-    A = B = 0.0
-    for _ in range(3):
-        if len(sel) < 4:
-            return None
-        sxx = sxy = syy = sxu = syu = 0.0
-        for p, u in sel:
-            c, s = math.cos(p), math.sin(p)
-            sxx += c * c
-            sxy += c * s
-            syy += s * s
-            sxu += c * u
-            syu += s * u
-        det = sxx * syy - sxy * sxy
-        if det < 1e-9:
-            return None
-        A = (sxu * syy - syu * sxy) / det
-        B = (syu * sxx - sxu * sxy) / det
-        keep = [(p, u) for (p, u) in sel
-                if abs(A * math.cos(p) + B * math.sin(p) - u) < 0.08 * u]
-        if len(keep) == len(sel):
-            break
-        sel = keep
-    if math.hypot(A, B) < 1e-6:
-        return None
-    return math.atan2(B, A), 1.0 / math.hypot(A, B)
-
-
-def predict_reading(x0, y0, alpha):
-    ca, sa = math.cos(alpha), math.sin(alpha)
-    t = INF
-    if ca > 1e-9:
-        t = min(t, (ARENA_W - WALL_HALF - x0) / ca)
-    if ca < -1e-9:
-        t = min(t, (WALL_HALF - x0) / ca)
-    if sa > 1e-9:
-        t = min(t, (ARENA_H - WALL_HALF - y0) / sa)
-    if sa < -1e-9:
-        t = min(t, (WALL_HALF - y0) / sa)
-    return min(MAXR, t - FRONT_OFFSET)
-
-
-def localise_from_scan(samples):
-    """samples: list of (phi, d) with phi = spin angle in the robot's own
-    (arbitrary zero) frame, CCW positive, d = front sensor reading.
-    Returns (x0, y0, phi_x) where phi_x = phi at which the robot faces world +x,
-    or None."""
-    pts = [(p, d + FRONT_OFFSET) for (p, d) in samples if d < 0.55]
-    if len(pts) < 20:
-        return None
-    pm, _ = min(pts, key=lambda q: q[1])
-    w1 = fit_wall(pts, pm, 0.35)
-    if w1 is None:
-        return None
-    a1, D1 = w1
-    best = None
-    for sgn in (-1, 1):
-        c = wrap(a1 + sgn * math.pi / 2)
-        w = fit_wall(pts, c, 0.21)
-        if w is not None and abs(wrap(w[0] - c)) < 0.15:
-            if best is None or w[1] < best[1][1]:
-                best = (sgn, w)
-    if best is None:
-        return None
-    sgn, (a2, D2) = best
-    if sgn == -1:          # near wall = right wall (+x normal), other = bottom
-        phi_x, Dx, Dy = a1, D1, D2
-    else:                  # near wall = bottom (-y normal); +x normal is +90 deg
-        phi_x, Dx, Dy = a2, D2, D1
-    if not (0.04 <= Dx <= 0.35 and 0.04 <= Dy <= 0.35):
-        return None
-    x0 = ARENA_W - WALL_HALF - Dx
-    y0 = WALL_HALF + Dy
-    # verify against the forward model of the two corner walls
-    good = 0
-    for p, d in samples:
-        pred = predict_reading(x0, y0, p - phi_x)
-        if abs(min(d, MAXR) - pred) < 0.015:
-            good += 1
-    if good < 0.75 * len(samples):
-        return None
-    return x0, y0, phi_x
-
-
-# ----------------------------------------------------------------------------
-# Robot wrapper: devices, odometry, heading
-# ----------------------------------------------------------------------------
-def get_dev(robot, name):
-    """getDevice with a helpful error (lists what the robot really has)."""
-    d = robot.getDevice(name)
-    if d is None:
-        have = [robot.getDeviceByIndex(i).getName()
-                for i in range(robot.getNumberOfDevices())]
-        raise RuntimeError(
-            "Device '%s' not found on the robot. Devices present: %s.\n"
-            "-> The robot is not using the updated TwoWheelRobot.proto "
-            "(see the fix steps)." % (name, have))
-    return d
-
+# ============================================================
+# ROBOT
+# ============================================================
 
 class Bot:
-    def __init__(self):
-        self.robot = Robot()
-        self.dt_ms = int(round(self.robot.getBasicTimeStep()))
-        self.dt = self.dt_ms / 1000.0
-        r = self.robot
-        self.lm = get_dev(r, 'left_wheel_motor')
-        self.rm = get_dev(r, 'right_wheel_motor')
-        for m in (self.lm, self.rm):
-            m.setPosition(float('inf'))
-            m.setVelocity(0.0)
-        self.ls = get_dev(r, 'left_wheel_sensor')
-        self.rs = get_dev(r, 'right_wheel_sensor')
-        self.ls.enable(self.dt_ms)
-        self.rs.enable(self.dt_ms)
-        self.imu = get_dev(r, 'imu')
-        self.imu.enable(self.dt_ms)
-        self.ds = []
-        for name, x, y, a in SENSORS:
-            dev = get_dev(r, name)
-            dev.enable(self.dt_ms)
-            self.ds.append((dev, x, y, math.radians(a)))
-        self.d = [MAXR] * len(self.ds)
 
-        self.x = self.y = self.th = 0.0
-        self.calibrated = False
-        self.imu_prev = None
-        self.imu_unw = 0.0
-        self.th_off = 0.0
-        self.sign = 1.0
-        self.wl_prev = self.wr_prev = None
-        self.th_wheel = 0.0
-        self.t = 0.0
+    def __init__(self, robot):
 
-    # -- basic I/O ------------------------------------------------------------
-    def drive_wheels(self, wl, wr):
-        self.lm.setVelocity(max(-10.0, min(10.0, wl)))
-        self.rm.setVelocity(max(-10.0, min(10.0, wr)))
+        self.robot = robot
 
-    def drive(self, v, w):
-        wl = (v - w * AXLE / 2.0) / WHEEL_R
-        wr = (v + w * AXLE / 2.0) / WHEEL_R
-        m = max(abs(wl), abs(wr))
-        if m > MAX_WHEEL:
-            wl *= MAX_WHEEL / m
-            wr *= MAX_WHEEL / m
-        self.drive_wheels(wl, wr)
+        # ====================================================
+        # MOTORS
+        # ====================================================
+
+        self.left_motor = robot.getDevice(
+            "left_wheel_motor"
+        )
+
+        self.right_motor = robot.getDevice(
+            "right_wheel_motor"
+        )
+
+        self.left_motor.setPosition(
+            float("inf")
+        )
+
+        self.right_motor.setPosition(
+            float("inf")
+        )
+
+        self.left_motor.setVelocity(0.0)
+        self.right_motor.setVelocity(0.0)
+
+        # ====================================================
+        # ENCODERS
+        # ====================================================
+
+        self.left_encoder = robot.getDevice(
+            "left_wheel_sensor"
+        )
+
+        self.right_encoder = robot.getDevice(
+            "right_wheel_sensor"
+        )
+
+        self.left_encoder.enable(
+            TIME_STEP
+        )
+
+        self.right_encoder.enable(
+            TIME_STEP
+        )
+
+        # ====================================================
+        # IMU
+        # ====================================================
+
+        self.imu = robot.getDevice(
+            "imu"
+        )
+
+        self.imu.enable(
+            TIME_STEP
+        )
+
+        # ====================================================
+        # DISTANCE SENSORS
+        # ====================================================
+
+        self.sensors = []
+
+        for name in SENSOR_NAMES:
+
+            sensor = robot.getDevice(
+                name
+            )
+
+            sensor.enable(
+                TIME_STEP
+            )
+
+            self.sensors.append(
+                sensor
+            )
+        
+        # ====================================================
+        # CAMERA
+        # ====================================================
+
+        self.camera = robot.getDevice("front_camera")
+        self.camera.enable(TIME_STEP)
+
+        # ====================================================
+        # POSE
+        # ====================================================
+
+        # The robot starts at the origin of its own map.
+        #
+        # This is NOT assuming the competition transition
+        # or obstacle coordinates.
+        self.x = 0.0
+        self.y = 0.0
+
+        # Heading is initialized from the IMU.
+        self.th = 0.0
+
+        self.imu_offset = None
+
+        self.prev_left = None
+        self.prev_right = None
+
+        # ====================================================
+        # MAP
+        # ====================================================
+
+        self.grid = OccupancyGrid()
+
+        # ====================================================
+        # EXPLORATION MEMORY
+        # ====================================================
+
+        # Cells that the robot has physically visited.
+        #
+        # We do NOT forbid travelling through these cells.
+        # They may be necessary to reach a new frontier.
+        self.visited_cells = set()
+
+        # Previously selected frontier targets.
+        #
+        # This prevents repeatedly selecting the exact same
+        # exploration point.
+        self.completed_frontiers = set()
+
+        # ====================================================
+        # DEBUG
+        # ====================================================
+
+        self.last_sensor_print = -10.0
+        self.last_pose_print = -10.0
+
+    # ========================================================
+    # MOTOR CONTROL
+    # ========================================================
+
+    def drive(self, left, right):
+
+        left = clamp(
+            left,
+            -MAX_MOTOR,
+            MAX_MOTOR
+        )
+
+        right = clamp(
+            right,
+            -MAX_MOTOR,
+            MAX_MOTOR
+        )
+
+        self.left_motor.setVelocity(
+            left
+        )
+
+        self.right_motor.setVelocity(
+            right
+        )
+
+    def stop(self):
+
+        self.drive(
+            0.0,
+            0.0
+        )
+
+    # ========================================================
+    # SENSOR READINGS
+    # ========================================================
+
+    def sensor_values(self):
+
+        values = []
+
+        for sensor in self.sensors:
+
+            try:
+
+                value = sensor.getValue()
+
+                if not math.isfinite(value):
+
+                    value = SENSOR_RANGE
+
+                value = clamp(
+                    value,
+                    0.001,
+                    SENSOR_RANGE
+                )
+
+            except Exception:
+
+                value = SENSOR_RANGE
+
+            values.append(value)
+
+        return values
+
+    # ========================================================
+    # IMU
+    # ========================================================
+
+    def imu_heading(self):
+
+        values = self.imu.getRollPitchYaw()
+
+        if values is None:
+            return self.th
+
+        return values[2]
+
+    # ========================================================
+    # INITIALIZE HEADING
+    # ========================================================
+
+    def initialize_pose(self):
+
+        imu_theta = self.imu_heading()
+
+        self.imu_offset = imu_theta
+
+        self.th = 0.0
+
+        print(
+            f"[POSE] Initial IMU heading = "
+            f"{imu_theta:.3f} rad"
+        )
+
+        print(
+            "[POSE] Local map origin = (0, 0)"
+        )
+
+    # ========================================================
+    # POSE UPDATE
+    # ========================================================
+
+    def update_pose(self):
+
+        left = self.left_encoder.getValue()
+        right = self.right_encoder.getValue()
+
+        # First encoder reading.
+        if self.prev_left is None:
+
+            self.prev_left = left
+            self.prev_right = right
+
+            return
+
+        # ----------------------------------------------------
+        # Wheel movement
+        # ----------------------------------------------------
+
+        dl = (
+            left - self.prev_left
+        ) * WHEEL_RADIUS
+
+        dr = (
+            right - self.prev_right
+        ) * WHEEL_RADIUS
+
+        self.prev_left = left
+        self.prev_right = right
+
+        # Centre displacement.
+        dc = (
+            dl + dr
+        ) * 0.5
+
+        # Wheel odometry heading change.
+        dtheta_odo = (
+            dr - dl
+        ) / AXLE_LENGTH
+
+        # ----------------------------------------------------
+        # IMU heading
+        # ----------------------------------------------------
+
+        imu_raw = self.imu_heading()
+
+        if self.imu_offset is None:
+
+            self.imu_offset = imu_raw
+
+        imu_theta = wrap(
+            imu_raw - self.imu_offset
+        )
+
+        # ----------------------------------------------------
+        # Odometry predicted heading
+        # ----------------------------------------------------
+
+        predicted_theta = wrap(
+            self.th + dtheta_odo
+        )
+
+        # Difference between IMU and odometry.
+        imu_error = wrap(
+            imu_theta -
+            predicted_theta
+        )
+
+        # ----------------------------------------------------
+        # Sensor fusion
+        # ----------------------------------------------------
+        #
+        # Odometry gives movement.
+        #
+        # IMU stabilizes orientation.
+        #
+        # We use a moderate correction rather than letting
+        # one sensor completely dominate.
+        # ----------------------------------------------------
+
+        self.th = wrap(
+            predicted_theta +
+            0.35 * imu_error
+        )
+
+        # ----------------------------------------------------
+        # Position
+        # ----------------------------------------------------
+
+        self.x += (
+            dc *
+            math.cos(self.th)
+        )
+
+        self.y += (
+            dc *
+            math.sin(self.th)
+        )
+
+        # ----------------------------------------------------
+        # Mark current map cell as visited.
+        # ----------------------------------------------------
+
+        gx, gy = self.grid.world_to_grid(
+            self.x,
+            self.y
+        )
+
+        self.visited_cells.add(
+            (gx, gy)
+        )
+
+    # ========================================================
+    # SENSOR RAY TRANSFORMATION
+    # ========================================================
+
+    def sensor_world_pose(
+        self,
+        index
+    ):
+
+        offset_x, offset_y = (
+            SENSOR_OFFSETS[index]
+        )
+
+        # Rotate sensor offset into world frame.
+
+        world_x = (
+            self.x +
+            offset_x *
+            math.cos(self.th) -
+            offset_y *
+            math.sin(self.th)
+        )
+
+        world_y = (
+            self.y +
+            offset_x *
+            math.sin(self.th) +
+            offset_y *
+            math.cos(self.th)
+        )
+
+        return (
+            world_x,
+            world_y
+        )
+
+    # ========================================================
+    # MAP UPDATE
+    # ========================================================
+
+    def update_map(self):
+
+        readings = self.sensor_values()
+
+        for index, (
+            distance_value,
+            sensor_angle
+        ) in enumerate(
+            zip(
+                readings,
+                SENSOR_ANGLES
+            )
+        ):
+
+            # ------------------------------------------------
+            # Sensor world position
+            # ------------------------------------------------
+
+            sx, sy = self.sensor_world_pose(
+                index
+            )
+
+            # ------------------------------------------------
+            # Sensor world direction
+            # ------------------------------------------------
+
+            angle = wrap(
+                self.th +
+                sensor_angle
+            )
+
+            # ------------------------------------------------
+            # Determine whether the sensor actually saw
+            # an obstacle.
+            # ------------------------------------------------
+
+            hit_obstacle = (
+                distance_value <
+                SENSOR_RANGE * 0.97
+            )
+
+            # ------------------------------------------------
+            # If no obstacle was detected, the ray still
+            # tells us that space up to SENSOR_RANGE is free.
+            # ------------------------------------------------
+
+            ray_distance = min(
+                distance_value,
+                SENSOR_RANGE
+            )
+
+            # ------------------------------------------------
+            # Endpoint
+            # ------------------------------------------------
+
+            ex = (
+                sx +
+                ray_distance *
+                math.cos(angle)
+            )
+
+            ey = (
+                sy +
+                ray_distance *
+                math.sin(angle)
+            )
+
+            # ------------------------------------------------
+            # Grid coordinates
+            # ------------------------------------------------
+
+            gx0, gy0 = (
+                self.grid.world_to_grid(
+                    sx,
+                    sy
+                )
+            )
+
+            gx1, gy1 = (
+                self.grid.world_to_grid(
+                    ex,
+                    ey
+                )
+            )
+
+            # ------------------------------------------------
+            # Ray tracing
+            # ------------------------------------------------
+
+            dx = gx1 - gx0
+            dy = gy1 - gy0
+
+            steps = max(
+                abs(dx),
+                abs(dy),
+                1
+            )
+
+            for i in range(steps):
+
+                t = i / steps
+
+                gx = int(
+                    round(
+                        gx0 +
+                        dx * t
+                    )
+                )
+
+                gy = int(
+                    round(
+                        gy0 +
+                        dy * t
+                    )
+                )
+
+                self.grid.update_free(
+                    gx,
+                    gy
+                )
+
+            # ------------------------------------------------
+            # If an obstacle was detected, mark the endpoint
+            # occupied.
+            # ------------------------------------------------
+
+            if hit_obstacle:
+
+                self.grid.update_occupied(
+                    gx1,
+                    gy1
+                )
+
+    # ========================================================
+    # OBSTACLE INFORMATION
+    # ========================================================
+
+    def obstacle_information(self):
+
+        r = self.sensor_values()
+
+        return {
+
+            "left": r[0],
+
+            "left60": r[1],
+
+            "left40": r[2],
+
+            "left20": r[3],
+
+            "front": r[4],
+
+            "right20": r[5],
+
+            "right40": r[6],
+
+            "right60": r[7],
+
+            "right": r[8],
+        }
+
+    # ========================================================
+    # FRONTIER DETECTION
+    # ========================================================
+
+    def frontier_cells(self):
+
+        frontiers = []
+
+        gx0, gy0 = (
+            self.grid.world_to_grid(
+                self.x,
+                self.y
+            )
+        )
+
+        min_x = max(
+            1,
+            gx0 -
+            FRONTIER_SEARCH_RADIUS
+        )
+
+        max_x = min(
+            self.grid.w - 2,
+            gx0 +
+            FRONTIER_SEARCH_RADIUS
+        )
+
+        min_y = max(
+            1,
+            gy0 -
+            FRONTIER_SEARCH_RADIUS
+        )
+
+        max_y = min(
+            self.grid.h - 2,
+            gy0 +
+            FRONTIER_SEARCH_RADIUS
+        )
+
+        # ----------------------------------------------------
+        # Search known free cells.
+        # ----------------------------------------------------
+
+        for gx in range(
+            min_x,
+            max_x + 1
+        ):
+
+            for gy in range(
+                min_y,
+                max_y + 1
+            ):
+
+                # Frontier must itself be free.
+                if not self.grid.free(
+                    gx,
+                    gy
+                ):
+                    continue
+
+                # ------------------------------------------------
+                # Do not use an already completed frontier.
+                # ------------------------------------------------
+
+                if (
+                    gx,
+                    gy
+                ) in self.completed_frontiers:
+
+                    continue
+
+                # ------------------------------------------------
+                # Check neighbouring cells for UNKNOWN space.
+                # ------------------------------------------------
+
+                has_unknown = False
+
+                for dx, dy in (
+                    (1, 0),
+                    (-1, 0),
+                    (0, 1),
+                    (0, -1)
+                ):
+
+                    nx = gx + dx
+                    ny = gy + dy
+
+                    if not self.grid.inside(
+                        nx,
+                        ny
+                    ):
+                        continue
+
+                    if self.grid.unknown(
+                        nx,
+                        ny
+                    ):
+
+                        has_unknown = True
+                        break
+
+                if not has_unknown:
+                    continue
+
+                wx, wy = (
+                    self.grid.grid_to_world(
+                        gx,
+                        gy
+                    )
+                )
+
+                d = math.hypot(
+                    wx - self.x,
+                    wy - self.y
+                )
+
+                # Avoid selecting a frontier directly
+                # underneath the robot.
+
+                if d < MIN_FRONTIER_DISTANCE:
+                    continue
+
+                frontiers.append(
+                    (
+                        gx,
+                        gy,
+                        wx,
+                        wy
+                    )
+                )
+
+        return frontiers
+
+    # ========================================================
+    # FRONTIER INFORMATION GAIN
+    # ========================================================
+
+    def frontier_information_gain(
+        self,
+        gx,
+        gy
+    ):
+
+        # Count unknown cells around this frontier.
+        #
+        # A frontier with more unknown neighbours has a higher
+        # probability of revealing new space.
+
+        gain = 0
+
+        radius = 4
+
+        for dx in range(
+            -radius,
+            radius + 1
+        ):
+
+            for dy in range(
+                -radius,
+                radius + 1
+            ):
+
+                if (
+                    dx * dx +
+                    dy * dy
+                ) > radius * radius:
+
+                    continue
+
+                nx = gx + dx
+                ny = gy + dy
+
+                if not self.grid.inside(
+                    nx,
+                    ny
+                ):
+                    continue
+
+                if self.grid.unknown(
+                    nx,
+                    ny
+                ):
+
+                    gain += 1
+
+        return gain
+
+    # ========================================================
+    # CHOOSE EXPLORATION TARGET
+    # ========================================================
+
+    def choose_target(self):
+
+        frontiers = (
+            self.frontier_cells()
+        )
+
+        if not frontiers:
+            return None
+
+        best_target = None
+        best_score = float("inf")
+
+        for gx, gy, wx, wy in frontiers:
+
+            distance_to_frontier = math.hypot(
+                wx - self.x,
+                wy - self.y
+            )
+
+            information_gain = (
+                self.frontier_information_gain(
+                    gx,
+                    gy
+                )
+            )
+
+            # ------------------------------------------------
+            # Score
+            # ------------------------------------------------
+            #
+            # Lower score is better.
+            #
+            # Distance matters because we do not want the robot
+            # travelling unnecessarily far.
+            #
+            # Information gain is rewarded because the purpose
+            # of the frontier is to discover new space.
+            # ------------------------------------------------
+
+            score = (
+                distance_to_frontier
+                -
+                0.006 *
+                information_gain
+            )
+
+            # Small penalty for cells already physically
+            # visited by the robot.
+            if (
+                gx,
+                gy
+            ) in self.visited_cells:
+
+                score += 0.08
+
+            if score < best_score:
+
+                best_score = score
+
+                best_target = (
+                    wx,
+                    wy
+                )
+
+        return best_target
+
+    # ========================================================
+    # GRID INFLATION
+    # ========================================================
+
+    def inflated_occupied(
+        self,
+        gx,
+        gy
+    ):
+
+        radius_cells = int(
+            math.ceil(
+                INFLATION_RADIUS /
+                GRID_RES
+            )
+        )
+
+        for dx in range(
+            -radius_cells,
+            radius_cells + 1
+        ):
+
+            for dy in range(
+                -radius_cells,
+                radius_cells + 1
+            ):
+
+                if (
+                    dx * dx +
+                    dy * dy
+                ) > (
+                    radius_cells *
+                    radius_cells
+                ):
+
+                    continue
+
+                nx = gx + dx
+                ny = gy + dy
+
+                if self.grid.occupied(
+                    nx,
+                    ny
+                ):
+
+                    return True
+
+        return False
+
+    # ========================================================
+    # A*
+    # ========================================================
+
+    def astar(
+        self,
+        start,
+        goal
+    ):
+
+        sx, sy = start
+        gx, gy = goal
+
+        if not self.grid.inside(
+            sx,
+            sy
+        ):
+            return []
+
+        if not self.grid.inside(
+            gx,
+            gy
+        ):
+            return []
+
+        # ----------------------------------------------------
+        # If goal is occupied, no path.
+        # ----------------------------------------------------
+
+        if self.inflated_occupied(
+            gx,
+            gy
+        ):
+
+            return []
+
+        open_set = []
+
+        heapq.heappush(
+            open_set,
+            (
+                0.0,
+                (sx, sy)
+            )
+        )
+
+        came_from = {}
+
+        g_cost = {
+            (sx, sy): 0.0
+        }
+
+        closed = set()
+
+        # ----------------------------------------------------
+        # Heuristic
+        # ----------------------------------------------------
+
+        def heuristic(a, b):
+
+            return math.hypot(
+                a[0] - b[0],
+                a[1] - b[1]
+            )
+
+        # ----------------------------------------------------
+        # Search
+        # ----------------------------------------------------
+
+        while open_set:
+
+            _, current = (
+                heapq.heappop(
+                    open_set
+                )
+            )
+
+            if current in closed:
+                continue
+
+            closed.add(
+                current
+            )
+
+            # ------------------------------------------------
+            # Goal reached
+            # ------------------------------------------------
+
+            if current == (
+                gx,
+                gy
+            ):
+
+                path = []
+
+                node = current
+
+                while node in came_from:
+
+                    path.append(
+                        node
+                    )
+
+                    node = came_from[
+                        node
+                    ]
+
+                path.append(
+                    (
+                        sx,
+                        sy
+                    )
+                )
+
+                path.reverse()
+
+                return path
+
+            cx, cy = current
+
+            # ------------------------------------------------
+            # 8-connected movement
+            # ------------------------------------------------
+
+            neighbours = (
+                (1, 0),
+                (-1, 0),
+                (0, 1),
+                (0, -1),
+                (1, 1),
+                (1, -1),
+                (-1, 1),
+                (-1, -1)
+            )
+
+            for dx, dy in neighbours:
+
+                nx = cx + dx
+                ny = cy + dy
+
+                if not self.grid.inside(
+                    nx,
+                    ny
+                ):
+                    continue
+
+                # Never plan through occupied/inflated cells.
+
+                if self.inflated_occupied(
+                    nx,
+                    ny
+                ):
+
+                    continue
+
+                # ------------------------------------------------
+                # Prevent diagonal corner cutting.
+                # ------------------------------------------------
+
+                if (
+                    abs(dx) == 1 and
+                    abs(dy) == 1
+                ):
+
+                    if (
+                        self.inflated_occupied(
+                            cx + dx,
+                            cy
+                        )
+                        or
+                        self.inflated_occupied(
+                            cx,
+                            cy + dy
+                        )
+                    ):
+
+                        continue
+
+                diagonal = (
+                    abs(dx) == 1 and
+                    abs(dy) == 1
+                )
+
+                step_cost = (
+                    1.4142
+                    if diagonal
+                    else 1.0
+                )
+
+                # ------------------------------------------------
+                # Unknown space is slightly more expensive.
+                #
+                # The target itself is a frontier, so the robot
+                # can approach the boundary of unknown space.
+                # ------------------------------------------------
+
+                if self.grid.unknown(
+                    nx,
+                    ny
+                ):
+
+                    step_cost *= 1.25
+
+                new_cost = (
+                    g_cost[current]
+                    +
+                    step_cost
+                )
+
+                neighbour = (
+                    nx,
+                    ny
+                )
+
+                if (
+                    neighbour not in g_cost
+                    or
+                    new_cost <
+                    g_cost[neighbour]
+                ):
+
+                    g_cost[
+                        neighbour
+                    ] = new_cost
+
+                    priority = (
+                        new_cost
+                        +
+                        heuristic(
+                            neighbour,
+                            (gx, gy)
+                        )
+                    )
+
+                    heapq.heappush(
+                        open_set,
+                        (
+                            priority,
+                            neighbour
+                        )
+                    )
+
+                    came_from[
+                        neighbour
+                    ] = current
+
+        return []
+
+    # ========================================================
+    # PATH LINE OF SIGHT
+    # ========================================================
+
+    def line_is_clear(
+        self,
+        a,
+        b
+    ):
+
+        x0, y0 = a
+        x1, y1 = b
+
+        dist = math.hypot(
+            x1 - x0,
+            y1 - y0
+        )
+
+        steps = max(
+            1,
+            int(
+                dist /
+                GRID_RES
+            )
+        )
+
+        for i in range(
+            steps + 1
+        ):
+
+            t = i / steps
+
+            x = (
+                x0 +
+                (x1 - x0) * t
+            )
+
+            y = (
+                y0 +
+                (y1 - y0) * t
+            )
+
+            gx, gy = (
+                self.grid.world_to_grid(
+                    x,
+                    y
+                )
+            )
+
+            if self.inflated_occupied(
+                gx,
+                gy
+            ):
+
+                return False
+
+        return True
+
+    # ========================================================
+    # PATH SIMPLIFICATION
+    # ========================================================
+
+    def simplify_path(
+        self,
+        path
+    ):
+
+        if len(path) <= 2:
+            return path
+
+        result = []
+
+        i = 0
+
+        while i < len(path):
+
+            result.append(
+                path[i]
+            )
+
+            best = i + 1
+
+            for j in range(
+                i + 1,
+                len(path)
+            ):
+
+                a = (
+                    self.grid.grid_to_world(
+                        *path[i]
+                    )
+                )
+
+                b = (
+                    self.grid.grid_to_world(
+                        *path[j]
+                    )
+                )
+
+                if self.line_is_clear(
+                    a,
+                    b
+                ):
+
+                    best = j
+
+            i = best
+
+        return result
+
+    # ========================================================
+    # DEBUG PRINT
+    # ========================================================
+
+    def debug_print(self):
+
+        now = self.robot.getTime()
+
+        if (
+            now -
+            self.last_pose_print
+            > 1.0
+        ):
+
+            self.last_pose_print = now
+
+            print(
+                "[POSE] "
+                f"x={self.x:.3f} "
+                f"y={self.y:.3f} "
+                f"theta={math.degrees(self.th):.1f}°"
+            )
+
+        if (
+            now -
+            self.last_sensor_print
+            > 2.0
+        ):
+
+            self.last_sensor_print = now
+
+            r = self.sensor_values()
+
+            print(
+                "[SENSORS] "
+                f"L={r[0]:.2f} "
+                f"L60={r[1]:.2f} "
+                f"L40={r[2]:.2f} "
+                f"L20={r[3]:.2f} "
+                f"F={r[4]:.2f} "
+                f"R20={r[5]:.2f} "
+                f"R40={r[6]:.2f} "
+                f"R60={r[7]:.2f} "
+                f"R={r[8]:.2f}"
+            )
+
+    # ========================================================
+    # STEP
+    # ========================================================
 
     def step(self):
-        if self.robot.step(self.dt_ms) == -1:
+
+        if self.robot.step(
+            TIME_STEP
+        ) == -1:
+
             return False
-        self.t += self.dt
-        self._read()
-        return True
 
-    def _read(self):
-        # distance sensors
-        for k, (dev, _, _, _) in enumerate(self.ds):
-            v = dev.getValue()
-            if v != v:                      # NaN guard
-                v = MAXR
-            self.d[k] = max(0.0, min(MAXR, v))
-        # imu (unwrapped yaw)
-        yaw = self.imu.getRollPitchYaw()[2]
-        if yaw == yaw:
-            if self.imu_prev is None:
-                self.imu_prev = yaw
-            self.imu_unw += wrap(yaw - self.imu_prev)
-            self.imu_prev = yaw
-        # wheels
-        wl, wr = self.ls.getValue(), self.rs.getValue()
-        if self.wl_prev is None:
-            self.wl_prev, self.wr_prev = wl, wr
-        dl = (wl - self.wl_prev) * WHEEL_R
-        dr = (wr - self.wr_prev) * WHEEL_R
-        self.wl_prev, self.wr_prev = wl, wr
-        self.th_wheel += (dr - dl) / AXLE
-        if self.calibrated:
-            th_new = wrap(self.sign * self.imu_unw + self.th_off)
-            ds = 0.5 * (dl + dr)
-            thm = self.th + 0.5 * wrap(th_new - self.th)
-            self.x += ds * math.cos(thm)
-            self.y += ds * math.sin(thm)
-            self.th = th_new
+        self.update_pose()
 
-    # -- start-up localisation --------------------------------------------------
-    def localise(self):
-        """Hardcoded start pose as requested, skipping the 360 spin."""
-        self.sign = 1.0
-        # Hardcoded from the current Arena.wbt start pose
-        self.th_off = 2.32356  # Initial heading from Webots rotation
-        self.x, self.y = 2.26866, 0.159772
-        self.th = wrap(self.sign * self.imu_unw + self.th_off)
-        self.calibrated = True
-        
-        # Go forward at the beginning for a short duration to clear the corner
-        print("[loc] OVERRIDE: Skipped spin, driving forward...")
-        self.drive_wheels(MAX_WHEEL, MAX_WHEEL)
-        for _ in range(60):  # ~1 second forward
-            if not self.step():
-                return False
-                
-        self.drive_wheels(0.0, 0.0)
+        self.update_map()
+
+        self.debug_print()
+
         return True
 
 
-# ----------------------------------------------------------------------------
-# Mapping + planning + control
-# ----------------------------------------------------------------------------
-L_FREE, L_OCC, L_MIN, L_MAX, OCC_T = -0.25, 0.9, -3.0, 4.0, 0.85
-
+# ============================================================
+# NAVIGATOR
+# ============================================================
 
 class Navigator:
-    def __init__(self, bot):
-        self.b = bot
-        self.lo = [0.0] * (NX * NY)
-        self.occ = set()
-        self.blocked = bytearray(STATIC_BLOCKED)
-        self.path = None
-        self.path_age = 0
-        self.need_plan = True
-        self.rot_mode = False
-        self.n = 0
-        self.anchor = None
-        self.recover_until = 0.0
-        self.recover_dir = 1.0
-        self.recover_phase = 0
 
-    # -- mapping --------------------------------------------------------------
-    def _upd(self, idx, delta):
-        if OUTDOM[idx]:
-            return
-        v = self.lo[idx] + delta
-        v = L_MAX if v > L_MAX else (L_MIN if v < L_MIN else v)
-        self.lo[idx] = v
-        if v >= OCC_T:
-            self.occ.add(idx)
-        else:
-            self.occ.discard(idx)
+    def __init__(
+        self,
+        bot
+    ):
 
-    def integrate(self):
-        b = self.b
-        c, s = math.cos(b.th), math.sin(b.th)
-        for k, (_, sx, sy, ang) in enumerate(b.ds):
-            d = b.d[k]
-            ox = b.x + sx * c - sy * s
-            oy = b.y + sx * s + sy * c
-            a = b.th + ang
-            ca, sa = math.cos(a), math.sin(a)
-            hit = d < MAXR - 0.01
-            rmax = d if hit else 0.5
-            last = -1
-            t = 0.02
-            while t < rmax - 0.025:
-                i = int((ox + ca * t) / CELL)
-                j = int((oy + sa * t) / CELL)
-                if 0 <= i < NX and 0 <= j < NY:
-                    idx = j * NX + i
-                    if idx != last:
-                        self._upd(idx, L_FREE)
-                        last = idx
-                t += 0.01
-            if hit:
-                px, py = ox + ca * (d + 0.008), oy + sa * (d + 0.008)
-                i, j = int(px / CELL), int(py / CELL)
-                if 0 <= i < NX and 0 <= j < NY:
-                    self._upd(j * NX + i, L_OCC)
+        self.bot = bot
 
-    def refresh_blocked(self):
-        bl = bytearray(STATIC_BLOCKED)
-        for idx in self.occ:
-            i, j = idx % NX, idx // NX
-            for di, dj in OFFS:
-                ii, jj = i + di, j + dj
-                if 0 <= ii < NX and 0 <= jj < NY:
-                    bl[jj * NX + ii] = 1
-        self.blocked = bl
+        # Current A* path.
+        self.path = []
 
-    # -- planning -------------------------------------------------------------
-    def plan(self):
-        b = self.b
-        s = cell_of(b.x, b.y)
-        g = cell_of(*GOAL)
-        cells = astar(self.blocked, s, g)
-        if cells is None:                       # maybe phantom obstacles
-            print("[nav] no path - clearing dynamic map")
-            self.lo = [0.0] * (NX * NY)
-            self.occ.clear()
-            self.blocked = bytearray(STATIC_BLOCKED)
-            cells = astar(self.blocked, s, g)
-            if cells is None:
-                self.path = None
-                self.need_plan = False
-                return
-        pts = [((i + 0.5) * CELL, (j + 0.5) * CELL) for i, j in cells]
-        pts[-1] = GOAL
-        pts = smooth_path(self.blocked, pts)
-        self.path = [(b.x, b.y)] + pts
-        self.path_age = 0
-        self.need_plan = False
+        self.path_index = 0
 
-    def _project(self):
-        b = self.b
-        best = (INF, 0, 0.0)
-        P = self.path
-        for k in range(len(P) - 1):
-            ax, ay = P[k]
-            bx, by = P[k + 1]
-            dx, dy = bx - ax, by - ay
-            L2 = dx * dx + dy * dy
-            t = 0.0 if L2 < 1e-12 else max(0.0, min(1.0, ((b.x - ax) * dx + (b.y - ay) * dy) / L2))
-            d = math.hypot(b.x - (ax + t * dx), b.y - (ay + t * dy))
-            if d < best[0]:
-                best = (d, k, t)
-        return best
+        # Current exploration target.
+        self.target = None
 
-    def _walk(self, k, t, dist):
-        """Point at 'dist' metres along the path from (segment k, param t)."""
-        P = self.path
-        ax, ay = P[k]
-        bx, by = P[k + 1]
-        px, py = ax + t * (bx - ax), ay + t * (by - ay)
-        rem = dist
-        while True:
-            seg = math.hypot(bx - px, by - py)
-            if seg >= rem:
-                f = rem / seg if seg > 1e-9 else 1.0
-                return px + f * (bx - px), py + f * (by - py)
-            rem -= seg
-            px, py = bx, by
-            if k + 2 >= len(P):
-                return px, py
-            k += 1
-            bx, by = P[k + 1]
+        self.last_plan_time = -100.0
 
-    def path_ok(self, k, t):
-        for dist in [x * 0.03 for x in range(2, 30)]:
-            px, py = self._walk(k, t, dist)
-            i, j = cell_of(px, py)
-            if 0 <= i < NX and 0 <= j < NY and self.blocked[j * NX + i]:
+        # ----------------------------------------------------
+        # Progress monitoring
+        # ----------------------------------------------------
+
+        self.last_progress_x = bot.x
+        self.last_progress_y = bot.y
+
+        self.last_progress_time = 0.0
+
+        # ----------------------------------------------------
+        # Recovery
+        # ----------------------------------------------------
+
+        self.recovery_until = 0.0
+
+        self.recovery_direction = 1.0
+
+        # ----------------------------------------------------
+        # Target management
+        # ----------------------------------------------------
+
+        self.target_reached = False
+
+    # ========================================================
+    # TIME
+    # ========================================================
+
+    def now(self):
+
+        return self.bot.robot.getTime()
+
+    # ========================================================
+    # TARGET REACHED
+    # ========================================================
+
+    def target_is_reached(self):
+
+        if self.target is None:
+            return True
+
+        d = math.hypot(
+            self.target[0] -
+            self.bot.x,
+
+            self.target[1] -
+            self.bot.y
+        )
+
+        return (
+            d <
+            TARGET_REACHED_DISTANCE
+        )
+
+    # ========================================================
+    # PLAN
+    # ========================================================
+
+    def plan(
+        self,
+        force_new_target=False
+    ):
+
+        # ----------------------------------------------------
+        # Choose a new exploration frontier only when needed.
+        #
+        # This is important.
+        #
+        # We do NOT choose a different frontier every second.
+        # Otherwise the robot can continuously change its mind.
+        # ----------------------------------------------------
+
+        if (
+            force_new_target
+            or
+            self.target is None
+            or
+            self.target_is_reached()
+        ):
+
+            if self.target is not None:
+
+                old_gx, old_gy = (
+                    self.bot.grid.world_to_grid(
+                        self.target[0],
+                        self.target[1]
+                    )
+                )
+
+                self.bot.completed_frontiers.add(
+                    (
+                        old_gx,
+                        old_gy
+                    )
+                )
+
+            self.target = (
+                self.bot.choose_target()
+            )
+
+            if self.target is None:
+
+                self.path = []
+
+                print(
+                    "[PLAN] No unexplored frontier found."
+                )
+
                 return False
+
+        # ----------------------------------------------------
+        # Current robot cell
+        # ----------------------------------------------------
+
+        sx, sy = (
+            self.bot.grid.world_to_grid(
+                self.bot.x,
+                self.bot.y
+            )
+        )
+
+        # ----------------------------------------------------
+        # Target cell
+        # ----------------------------------------------------
+
+        gx, gy = (
+            self.bot.grid.world_to_grid(
+                self.target[0],
+                self.target[1]
+            )
+        )
+
+        # ----------------------------------------------------
+        # A*
+        # ----------------------------------------------------
+
+        raw_path = self.bot.astar(
+            (
+                sx,
+                sy
+            ),
+            (
+                gx,
+                gy
+            )
+        )
+
+        if not raw_path:
+
+            print(
+                "[PLAN] Target currently unreachable."
+            )
+
+            # Make this target unavailable for now.
+            self.bot.completed_frontiers.add(
+                (
+                    gx,
+                    gy
+                )
+            )
+
+            self.target = None
+            self.path = []
+
+            return False
+
+        self.path = (
+            self.bot.simplify_path(
+                raw_path
+            )
+        )
+
+        self.path_index = 0
+
+        self.last_plan_time = (
+            self.now()
+        )
+
+        print(
+            "[PLAN] "
+            f"target=({self.target[0]:.2f}, "
+            f"{self.target[1]:.2f}) "
+            f"path={len(self.path)}"
+        )
+
         return True
 
-    # -- control --------------------------------------------------------------
-    def at_goal(self):
-        b = self.b
-        return (math.hypot(b.x - GOAL[0], b.y - GOAL[1]) < 0.02 or
-                (b.y > 1.262 and abs(b.x - GOAL[0]) < 0.06))
+    # ========================================================
+    # CURRENT WAYPOINT
+    # ========================================================
 
-    def control(self, tx, ty):
-        b = self.b
-        e = wrap(math.atan2(ty - b.y, tx - b.x) - b.th)
-        dgoal = math.hypot(GOAL[0] - b.x, GOAL[1] - b.y)
-        if self.rot_mode:
-            if abs(e) < 0.2:
-                self.rot_mode = False
-        elif abs(e) > 0.55:
-            self.rot_mode = True
-        if self.rot_mode:
-            v = 0.0
-            w = max(-W_MAX, min(W_MAX, 3.0 * e))
-            if abs(w) < 0.6:
-                w = 0.6 if e > 0 else -0.6
+    def current_waypoint(self):
+
+        if not self.path:
+            return None
+
+        while (
+            self.path_index <
+            len(self.path)
+        ):
+
+            gx, gy = (
+                self.path[
+                    self.path_index
+                ]
+            )
+
+            wx, wy = (
+                self.bot.grid.grid_to_world(
+                    gx,
+                    gy
+                )
+            )
+
+            d = math.hypot(
+                wx - self.bot.x,
+                wy - self.bot.y
+            )
+
+            if d < 0.12:
+
+                self.path_index += 1
+
+            else:
+
+                return (
+                    wx,
+                    wy
+                )
+
+        return None
+
+    # ========================================================
+    # IMMEDIATE SENSOR SAFETY
+    # ========================================================
+
+    def reactive_avoidance(self):
+
+        info = (
+            self.bot.obstacle_information()
+        )
+
+        front = info["front"]
+
+        # ----------------------------------------------------
+        # Use ALL sensors to find the most free path
+        # ----------------------------------------------------
+        
+        left_max = max(
+            info["left"], 
+            info["left60"], 
+            info["left40"], 
+            info["left20"]
+        )
+        
+        right_max = max(
+            info["right"], 
+            info["right60"], 
+            info["right40"], 
+            info["right20"]
+        )
+
+        # ----------------------------------------------------
+        # Emergency front obstacle
+        # ----------------------------------------------------
+
+        if front < FRONT_EMERGENCY:
+
+            if left_max > right_max:
+                self.recovery_direction = -1.0
+            else:
+                self.recovery_direction = 1.0
+
+            return "emergency"
+
+        # ----------------------------------------------------
+        # Front blocked
+        # ----------------------------------------------------
+
+        if front < FRONT_BLOCK:
+
+            if left_max > right_max:
+                self.recovery_direction = -1.0
+            else:
+                self.recovery_direction = 1.0
+
+            return "blocked"
+
+        # ----------------------------------------------------
+        # Side collision protection
+        # ----------------------------------------------------
+
+        if info["left20"] < SIDE_BLOCK or info["left"] < SIDE_BLOCK / 1.5:
+
+            self.recovery_direction = 1.0
+
+            return "left_side"
+
+        if info["right20"] < SIDE_BLOCK or info["right"] < SIDE_BLOCK / 1.5:
+
+            self.recovery_direction = -1.0
+
+            return "right_side"
+
+        return None
+
+    # ========================================================
+    # RECOVERY CONTROL
+    # ========================================================
+
+    def recovery_control(self):
+
+        info = (
+            self.bot.obstacle_information()
+        )
+
+        front = info["front"]
+
+        # ----------------------------------------------------
+        # If extremely close, reverse.
+        # ----------------------------------------------------
+
+        if front < FRONT_EMERGENCY:
+
+            self.bot.drive(
+                -1.5,
+                -1.5
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # Otherwise make a curved escape.
+        # ----------------------------------------------------
+
+        if self.recovery_direction > 0:
+
+            self.bot.drive(
+                1.0,
+                -1.0
+            )
+
         else:
-            v = V_CRUISE * (1.0 - 0.6 * min(1.0, abs(e) / 0.55))
-            w = max(-W_MAX, min(W_MAX, 2.5 * e))
-            v = min(v, 0.04 + 0.6 * dgoal)                 # slow near the goal
-            fmin = min(b.d[k] for k in FRONT_IDX)
-            v = min(v, V_CRUISE * max(0.0, min(1.0, (fmin - 0.045) / 0.10)))
-        return v, w
 
-    def check_stuck(self):
-        b = self.b
-        if self.anchor is None:
-            self.anchor = (b.t, b.x, b.y, b.th)
-            return False
-        t0, x0, y0, th0 = self.anchor
-        if b.t - t0 < 3.0:
-            return False
-        moved = math.hypot(b.x - x0, b.y - y0) > 0.04 or abs(wrap(b.th - th0)) > 0.4
-        self.anchor = (b.t, b.x, b.y, b.th)
-        return not moved
+            self.bot.drive(
+                -1.0,
+                1.0
+            )
 
-    def start_recovery(self):
-        b = self.b
-        print("[nav] stuck -> recovery at (%.2f, %.2f)" % (b.x, b.y))
-        ci, cj = cell_of(b.x, b.y)
-        for dj in range(-10, 11):
-            for di in range(-10, 11):
-                i, j = ci + di, cj + dj
-                if 0 <= i < NX and 0 <= j < NY:
-                    self.lo[j * NX + i] = 0.0
-                    self.occ.discard(j * NX + i)
-        self.refresh_blocked()
-        self.recover_phase = 1
-        self.recover_until = b.t + 0.6
-        self.recover_dir = 1.0 if (int(b.t * 10) % 2 == 0) else -1.0
-        self.need_plan = True
+    # ========================================================
+    # SPEED LIMIT FROM SENSORS
+    # ========================================================
 
-    def recover(self):
-        b = self.b
-        if self.recover_phase == 1:
-            b.drive_wheels(-4.0, -4.0)
-            if b.t >= self.recover_until:
-                self.recover_phase = 2
-                self.recover_until = b.t + 0.5
-        else:
-            b.drive_wheels(-3.0 * self.recover_dir, 3.0 * self.recover_dir)
-            if b.t >= self.recover_until:
-                self.recover_phase = 0
-                self.anchor = None
+    def safe_speed(self):
 
-    # -- main loop ------------------------------------------------------------
-    def run(self):
-        b = self.b
-        while b.step():
-            self.integrate()
-            self.n += 1
-            if self.at_goal():
-                b.drive_wheels(0.0, 0.0)
-                print("[nav] Section 1 finished at t=%.1fs (%.3f, %.3f)" % (b.t, b.x, b.y))
-                break
-            if self.recover_phase:
-                self.recover()
-                continue
-            if self.n % 8 == 0:
-                self.refresh_blocked()
-                self.path_age += 8
-                if self.path is not None:
-                    _, k, t = self._project()
-                    if not self.path_ok(k, t) or self.path_age > 60:
-                        self.need_plan = True
-                else:
-                    self.need_plan = True
-            if self.need_plan:
-                self.plan()
-            if self.path is None:
-                b.drive_wheels(0.0, 0.0)
-                continue
-            if self.check_stuck():
-                self.start_recovery()
-                continue
-            _, k, t = self._project()
-            tx, ty = self._walk(k, t, LOOKAHEAD)
-            v, w = self.control(tx, ty)
-            b.drive(v, w)
-        b.drive_wheels(0.0, 0.0)
+        info = (
+            self.bot.obstacle_information()
+        )
 
+        front = info["front"]
+
+        # Very close.
+        if front < FRONT_EMERGENCY:
+
+            return 0.0
+
+        # Close.
+        if front < FRONT_BLOCK:
+
+            return 1.0
+
+        # Start slowing down before obstacle.
+        if front < FRONT_SLOW:
+
+            ratio = (
+                front -
+                FRONT_BLOCK
+            ) / (
+                FRONT_SLOW -
+                FRONT_BLOCK
+            )
+
+            return clamp(
+                1.5 +
+                2.0 * ratio,
+                1.5,
+                3.5
+            )
+
+        return MAX_WHEEL
+
+    # ========================================================
+    # MAIN CONTROL
+    # ========================================================
+
+    def control(self):
+
+        now = self.now()
+
+        # ====================================================
+        # RECOVERY MODE
+        # ====================================================
+
+        if now < self.recovery_until:
+
+            self.recovery_control()
+
+            return
+
+        # ====================================================
+        # PROGRESS MONITOR
+        # ====================================================
+
+        progress = math.hypot(
+            self.bot.x -
+            self.last_progress_x,
+
+            self.bot.y -
+            self.last_progress_y
+        )
+
+        if progress > MIN_PROGRESS:
+
+            self.last_progress_x = (
+                self.bot.x
+            )
+
+            self.last_progress_y = (
+                self.bot.y
+            )
+
+            self.last_progress_time = now
+
+        elif (
+            now -
+            self.last_progress_time
+            > STUCK_TIME
+        ):
+
+            print(
+                "[RECOVERY] "
+                "Robot appears stuck."
+            )
+
+            self.recovery_direction *= -1.0
+
+            self.recovery_until = (
+                now + 0.8
+            )
+
+            self.path = []
+
+            self.bot.stop()
+
+            return
+
+        # ====================================================
+        # IMMEDIATE SENSOR SAFETY
+        # ====================================================
+
+        avoidance = (
+            self.reactive_avoidance()
+        )
+
+        if avoidance is not None:
+
+            if avoidance == "emergency":
+
+                self.recovery_until = (
+                    now + 0.45
+                )
+
+            else:
+
+                self.recovery_until = (
+                    now + 0.35
+                )
+
+            self.path = []
+
+            self.recovery_control()
+
+            return
+
+        # ====================================================
+        # CHECK CURRENT TARGET
+        # ====================================================
+
+        if self.target_is_reached():
+
+            print(
+                "[EXPLORE] "
+                "Frontier reached."
+            )
+
+            self.path = []
+
+            self.target = None
+
+            self.plan(
+                force_new_target=True
+            )
+
+        # ====================================================
+        # REPLAN
+        # ====================================================
+
+        elif (
+            not self.path
+            or
+            now -
+            self.last_plan_time
+            > REPLAN_TIME
+        ):
+
+            # Replan the route to the SAME target.
+            #
+            # We only choose a new target when the old target
+            # has been reached or becomes impossible.
+
+            self.plan()
+
+        # ====================================================
+        # WAYPOINT
+        # ====================================================
+
+        waypoint = (
+            self.current_waypoint()
+        )
+
+        if waypoint is None:
+
+            self.plan(
+                force_new_target=True
+            )
+
+            waypoint = (
+                self.current_waypoint()
+            )
+
+            if waypoint is None:
+
+                # No target currently available.
+                #
+                # Do NOT blindly drive forward.
+                # Stop and let the map/exploration logic
+                # decide what to do next.
+
+                self.bot.stop()
+
+                return
+
+        wx, wy = waypoint
+
+        # ====================================================
+        # HEADING ERROR
+        # ====================================================
+
+        desired_heading = math.atan2(
+            wy - self.bot.y,
+            wx - self.bot.x
+        )
+
+        heading_error = wrap(
+            desired_heading -
+            self.bot.th
+        )
+
+        # ====================================================
+        # SENSOR-BASED SPEED
+        # ====================================================
+
+        speed = self.safe_speed()
+
+        if speed <= 0.0:
+
+            self.bot.stop()
+
+            return
+
+        # Reduce speed when heading error is large.
+
+        if abs(heading_error) > 1.3:
+
+            speed = min(
+                speed,
+                1.2
+            )
+
+        elif abs(heading_error) > 0.7:
+
+            speed = min(
+                speed,
+                2.2
+            )
+
+        # ====================================================
+        # PROPORTIONAL STEERING
+        # ====================================================
+
+        steering = (
+            0.6 *
+            heading_error
+        )
+
+        steering = clamp(steering, -0.6, 0.6)
+
+        left = (
+            speed -
+            steering
+        )
+
+        right = (
+            speed +
+            steering
+        )
+
+        # ====================================================
+        # SIDE CLEARANCE CORRECTION
+        # ====================================================
+
+        info = (
+            self.bot.obstacle_information()
+        )
+
+        # If very close to left wall, gently move right.
+        if info["left20"] < SIDE_SLOW:
+
+            correction = (
+                SIDE_SLOW -
+                info["left20"]
+            ) * 5.0
+
+            left += correction
+            right -= correction
+
+        # If very close to right wall, gently move left.
+        if info["right20"] < SIDE_SLOW:
+
+            correction = (
+                SIDE_SLOW -
+                info["right20"]
+            ) * 5.0
+
+            left -= correction
+            right += correction
+
+        # ====================================================
+        # FINAL MOTOR LIMIT
+        # ====================================================
+
+        left = clamp(
+            left,
+            -MAX_WHEEL,
+            MAX_WHEEL
+        )
+
+        right = clamp(
+            right,
+            -MAX_WHEEL,
+            MAX_WHEEL
+        )
+
+        self.bot.drive(
+            left,
+            right
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
-    bot = Bot()
-    if not bot.step():
-        return
-    if not bot.localise():
-        return
-    nav = Navigator(bot)
-    nav.run()
-    # Section 1 done.  (Section 2 maze logic will be added here later.)
-    while bot.step():
-        bot.drive_wheels(0.0, 0.0)
+
+    robot = Robot()
+
+    bot = Bot(
+        robot
+    )
+
+    navigator = Navigator(
+        bot
+    )
+
+    print()
+    print(
+        "=========================================="
+    )
+    print(
+        " PeraBots 2026 - Section 1"
+    )
+    print(
+        " Localization + Mapping + Exploration"
+    )
+    print(
+        "=========================================="
+    )
+    print()
+
+    print(
+        "Localization : Encoders + IMU"
+    )
+
+    print(
+        "Mapping      : Distance sensors"
+    )
+
+    print(
+        "Exploration  : Frontier detection"
+    )
+
+    print(
+        "Planning     : A*"
+    )
+
+    print(
+        "Safety       : Reactive sensor layer"
+    )
+
+    print()
+
+    print(
+        "Camera target detection is NOT enabled yet."
+    )
+
+    print(
+        "Red target will be added later."
+    )
+
+    print()
+
+    # ========================================================
+    # INITIAL SENSOR SETTLE
+    # ========================================================
+
+    for _ in range(10):
+
+        if not bot.step():
+
+            return
+
+    # ========================================================
+    # INITIALIZE LOCALIZATION
+    # ========================================================
+
+    bot.initialize_pose()
+
+    navigator.last_progress_time = (
+        robot.getTime()
+    )
+
+    navigator.last_progress_x = (
+        bot.x
+    )
+
+    navigator.last_progress_y = (
+        bot.y
+    )
+
+    # ========================================================
+    # INITIAL MAP UPDATE
+    # ========================================================
+
+    bot.update_map()
+
+    # ========================================================
+    # MAIN LOOP
+    # ========================================================
+
+    while robot.step(
+        TIME_STEP
+    ) != -1:
+
+        # ----------------------------------------------------
+        # Update localization.
+        # ----------------------------------------------------
+
+        bot.update_pose()
+
+        # ----------------------------------------------------
+        # Update occupancy map from sensors.
+        # ----------------------------------------------------
+
+        bot.update_map()
+
+        # ----------------------------------------------------
+        # Navigation / exploration.
+        # ----------------------------------------------------
+
+        navigator.control()
 
 
-main()
+if __name__ == "__main__":
+
+    main()
